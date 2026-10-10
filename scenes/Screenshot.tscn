@@ -1,0 +1,9 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/Screenshot.gd" id="1_shot"]
+
+[node name="Screenshot" type="Node3D"]
+script = ExtResource("1_shot")
+shot_path = "res://shots/shot.png"
+start_distance = 200.0
+frames_to_wait = 90

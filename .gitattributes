@@ -1,0 +1,16 @@
+# 统一按文本处理并按 LF 存储（Godot / GDScript 约定），避免 Windows 下 CRLF 噪音
+* text=auto eol=lf
+
+# 二进制资源不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ogg binary
+*.wav binary
+*.mp3 binary
+*.ttf binary
+*.otf binary
+*.res binary
+*.scn binary
+*.pck binary
