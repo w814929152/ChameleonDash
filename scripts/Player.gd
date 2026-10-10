@@ -39,19 +39,23 @@ var jump_t := 0.0
 var jump_from := 0
 var jump_to := 0
 var jump_cd := 0.0
-## 跳跃抛物线的系数（y = 层高 + _jump_b·t + _jump_a·t²）。
-## 顶点固定为 GameConfig.JUMP_APEX_Y —— 与落点无关，所以三种向上跳跃
-## （原地 / 上一层 / 上两层）共用同一条公式，只是系数不同。
+## 跳跃抛物线的系数（y = 出发层 + _jump_b·t + _jump_a·t²）。
+## 【2026-10-10 三次定稿】峰值 = GameConfig.jump_apex_from(出发层) = 出发层 + 4.4。
+## 峰值只由【出发层】决定，与落点无关 —— 因为跳跃不再指定目标层（见 request_jump）。
+## 三种向上的竖直动作（跳上一层 / 落回本层 / 无路时的原地弹）共用这一条公式。
 ## 【2026-10-10】取代了旧的 _jump_arc（"lerp + sin(πt)·弧高"那套）。
 var _jump_a := 0.0
 var _jump_b := 0.0
-## 本次空中的总时长。跳跃与坠落共用一套空中机制，但时长各自独立可调
-## （坠落比跳跃快 —— 重力本来就该更快，理由见 GameConfig.FALL_AIR_TIME）。
+## 本次空中的总时长。
+## 【2026-10-10 四次定稿】跳跃与坠落共用同一套空中机制，但时长的【来源】不同：
+##   跳跃 = 常量 JUMP_AIR_TIME（峰值是设计定的，时长是它的独立旋钮）
+##   坠落 = 自由落体 √(2h/g)，由落差算出来（见 GameConfig.fall_air_time）
+##   所以下坠这条路上 _air_time 是【结果】，不再是可调的参数。
 var _air_time := GameConfig.JUMP_AIR_TIME
 ## 本次空中是【坠落】（踩空/掉层）而不是【主动跳】。
 ## 用途：落地压扁更狠、HUD 文案区分"空中/坠落"。
 var falling := false
-## 上一帧的实际水平速度。跳跃落点解析要用它算"我落地时会跑到哪"（见 next_track_layer）。
+## 上一帧的实际水平速度。落点解析要用它算"我落地时会跑到哪"（见 _resolve_landing）。
 var _cur_speed := GameConfig.SPEED_BASE
 
 var dashing := false
@@ -274,23 +278,27 @@ func _update_jump(dt: float) -> void:
 			# 落地压扁：坠落砸得更狠，让"掉下来的"和"跳上去的"手感不同
 			_squash = 0.60 if falling else 0.72
 			falling = false
-		if jump_to < jump_from:
-			# 下跳 / 坠落：一律走 t² 加速 —— 从静止开始加速，才读得出"掉下去"。
-			# 线性补间看起来像"被平移下去"，这正是用户说的"瞬移"感。
-			# 主动下跳与踩空坠落共用这条曲线 —— 两者对玩家是同一件事：往下掉。
+		# 曲线由 falling 决定，不再由"落点是不是更低"决定 ——
+		#   下坠/踩空走 t²；跳跃走抛物线（先上后下）。
+		# 【2026-10-10 四次定稿】下坠的 t² 现在【就是】自由落体，不是"看起来像"：
+		#   y = 出发层 + (落点层−出发层)·t² ，t = 真实时间 / _air_time，
+		#   而 _air_time = √(2h/g) → 展开得 y = 出发层 − ½g·(真实时间)²，逐项相等。
+		#   所以这条曲线一个字都不用改，变的只是 _air_time 从常量变成了 g 的解 ——
+		#   落差越大，_air_time 越长，t² 自动把它拉成"掉得更远 = 掉得更久"。
+		#   这也顺带保住了剪影那半：_squash 仍按 t 线性长大，而 t 现在与真实速度同源。
+		# 【2026-10-10 三次定稿】旧版判据是 jump_to < jump_from，现在跳跃也可能落在
+		#   更低的层（在段末尾起跳、上一层又是缺口 → 跳出去落到底下那层）。
+		#   那次仍然是"跳"：先上升再落下来，所以必须走抛物线。用 falling 判才对。
+		if falling:
 			_y = lerpf(GameConfig.LAYER_Y[jump_from], GameConfig.LAYER_Y[jump_to], jump_t * jump_t)
 		else:
-			# 向上跳 / 原地跳：共用同一条【固定顶点】抛物线（见 GameConfig.JUMP_APEX_Y）。
+			# 跳跃：抛物线 y = 出发层 + b·t + a·t²，峰值 = 出发层 + 4.4。
 			#
-			# 【2026-10-10 用户要求：把跳跃和跳到上一层整合】
-			#   旧实现这里是两条公式两个常量 ——
-			#     上跳   y = lerp(层A, 层B, t) + sin(πt)·JUMP_ARC_HEIGHT
-			#     原地跳 y = 层高 + sin(πt)·INPLACE_JUMP_ARC
-			#   两条曲线的形状毫无关系，只是被调参凑成了"峰值一样高"。
-			#   现在两者是【同一条公式在 d=0 与 d=3.2 时的取值】——
-			#   整合是结构性的，不是凑的。
-			#
-			#   系数在 request_jump 里算好（抛物线过两个端点、峰值恰为 JUMP_APEX_Y）。
+			# 【2026-10-10 三次定稿】峰值只由【出发层】决定，与落点无关 ——
+			#   因为跳跃不再指定目标层（用户要求"只有单纯的跳跃"）。
+			#   于是"落回本层"与"跳上一层"弧高完全一样，弧线不再透露落点；
+			#   这件事交给脚下光环 + HUD 的层号（见 GameConfig 里的可读性说明）。
+			#   系数在 request_jump 里算好（抛物线过两个端点、峰值恰为峰值高度）。
 			#   不用 sin 而用抛物线：抛物线就是重力，sin 只是"看起来像弧"。
 			_y = GameConfig.LAYER_Y[jump_from] + _jump_b * jump_t + _jump_a * jump_t * jump_t
 	else:
@@ -311,14 +319,14 @@ func _check_track_gap() -> void:
 	if level.color_at(distance, layer) != GameConfig.NO_TRACK:
 		return
 
-	# 落到哪一层要在【落地时的距离】上解析 —— 与 next_track_layer 同一套规矩。
-	# 下落期间玩家还会前进 speed × FALL_AIR_TIME，用当前距离解析会拿错段。
-	var land := distance + _cur_speed * GameConfig.FALL_AIR_TIME
-	var target := -1
-	for i in range(layer - 1, -1, -1):
-		if level.color_at(land, i) != GameConfig.NO_TRACK:
-			target = i
-			break
+	# 【2026-10-10 三次定稿】这里不再自己写一遍下落扫描，改为调用 _resolve_landing
+	#   —— 区间 [0, layer−1]：必须往下走，且允许一次掉过多层（层1 空、层0 有跑道
+	#   是留空关卡里最常见的地形）。
+	# 【2026-10-10 四次定稿】落点时刻改成 _fall_time_to（自由落体 √(2h/g)）：
+	#   掉两层比掉一层慢，所以两层各自的穿越距离也不同 —— 这正是"自然下落"。
+	#   跳跃 / 主动下坠 / 踩空三条路径仍然共用同一个落点函数。
+	var from_layer := layer
+	var target := _resolve_landing(0, from_layer - 1, _fall_time_to)
 
 	if target < 0:
 		_die("坠落 —— 脚下与下方都没有跑道")
@@ -326,13 +334,16 @@ func _check_track_gap() -> void:
 
 	airborne = true
 	falling = true
-	_air_time = GameConfig.FALL_AIR_TIME
-	# 下坠不走抛物线（_jump_to < _jump_from 那条分支只做 t²），系数清零是防御性的：
-	#   万一将来有人把 jump_to/jump_from 改了，也不会拿上一次跳跃的系数来画坠落。
+	# 时长是【算出来的】，不是查表来的：落差越大掉得越久（旧版固定 0.5s 是错的）
+	_air_time = GameConfig.fall_air_time(from_layer, target)
+	# 下坠走 t²（由 falling 分支决定），而 t² 配上这个 _air_time 就是自由落体
+	#   （推导见 _update_jump 里那段注释），所以不需要额外的系数。
+	#   清零是防御性的：万一将来有人把 jump_to/jump_from 改了，
+	#   也不会拿上一次跳跃的系数来画坠落。
 	_jump_a = 0.0
 	_jump_b = 0.0
 	jump_t = 0.0
-	jump_from = layer
+	jump_from = from_layer
 	jump_to = target
 	# 按【次】计费，不按层数：掉 2 层与掉 1 层同价（见 GameConfig.FALL_ENERGY_COST）
 	energy = maxf(energy - GameConfig.FALL_ENERGY_COST, 0.0)
@@ -426,6 +437,13 @@ func _update_transform(dt: float) -> void:
 		_ring.scale = Vector3.ONE * (1.0 + (1.0 - s) * 0.6)
 
 func _update_fx(dt: float) -> void:
+	# 没进场景树就没有全局变换，GPUParticles3D 的 emitting 赋值会报
+	#   "Condition !is_inside_tree() is true"（它内部要拿全局位置算发射点）。
+	#   LogicTest 刻意直接 new Player 跑机制断言、不入树（验的是纯逻辑），
+	#   于是测试输出里会混进一条 ERROR —— 无害但污染"全绿"的可读性。
+	#   特效是纯表现层，没入树时整段跳过，不影响任何判定。
+	if not is_inside_tree():
+		return
 	if _dash_fx != null:
 		_dash_fx.emitting = dashing
 		if dashing:
@@ -444,119 +462,203 @@ func _update_fx(dt: float) -> void:
 # ------------------------------------------------------------
 # 操作
 # ------------------------------------------------------------
-## dir: +1 上一层 / -1 下一层。
+## 竖直动作。dir > 0 = 跳（W / 空格），dir < 0 = 落（S）。
 ##
-## 【2026-10-10 改】落点 = 该方向上【最近的实体跑道】，而不是"相邻层"。
-##   关卡大幅留空后，相邻层经常是空的。旧规则下"往空层跳"会让玩家立刻坠落
-##   —— 玩家朝正确方向做了一个操作，却因此受到惩罚，这是最坏的一类反馈。
-##   现在：空层被自动跳过；中途若有实体跑道，就落在它上面（不穿透实体）。
+## 【2026-10-10 三次定稿 · 跳跃不再指定目标层】
+##   用户原话：「去掉跳到上一层跑道的规则，只有单纯的跳跃，跳跃的高度可以
+##   足够让玩家跳到上一层的跑道」。
+##   于是这里不再有"该方向上最近的实体跑道"这种查表。动作只做两件事：
+##     ① 定一个【峰值高度】（跳 = 本层 + 4.4，落 = 本层）
+##     ② 问一次 _resolve_landing：这个峰值之下，最高的实体跑道在哪
+##   层是升上去之后自己撞上的 —— 跳跃不知道上面有没有路，关卡知道。
 ##
-## 该方向没有任何实体跑道 → 【原地跳】（不换层、不前进），按键依然有反馈。
-##   【2026-10-10 用户要求：玩家在任何时刻都可以跳跃】
-##   旧规则是静默 return（"无效输入，不扣能量"）。它源自"三层填满"的年代 ——
-##   那时"该方向没跑道"约等于"你在最顶层还想往上"，确实是没意义的输入，
-##   静默吞掉是对的。但大幅留空之后这个局面变成了高频事件：
-##   静默吞掉就不再是"过滤无意义输入"，而是"按键坏了"，见 next_track_layer 的注释。
-##   成本：同色轨道免费 / 异色轨道照收 8 点（GameConfig.INPLACE_JUMP_FREE_ON_SAME）。
+##   由此"只能跳一层"不再是规则而是几何推论（4.4 够到 +3.2，够不到 +6.4）；
+##   而"跳跃能跳多高"与"上面有什么"彻底解耦，所以：
+##     同一段跑道上，跳上去 / 弹回原地，用的【是同一条弧线】。
+##
+##   没有任何可落的跑道时（该方向前方是一片虚空）→ 退化成【原地弹跳】：
+##   不换层、不前进，但按键一定有反馈。这是旧规则里"该方向没有跑道 → 原地跳"
+##   那条在"单纯跳跃"下的自然残留 —— 跳跃绝不允许【按了就死】。
+##   代价定价：没换层才看颜色（同色免费 / 异色照收 8 点，见 INPLACE_JUMP_FREE_ON_SAME）；
+##   换了层一律 8 点。
 func request_jump(dir: int) -> void:
 	if not alive or airborne or jump_cd > 0.0 or level == null:
 		return
 
-	var target := next_track_layer(dir)
-	# 【2026-10-10 用户要求：玩家在任何时刻都可以跳跃】
-	#   旧规则 = 该方向没有实体跑道就静默 return。那在"三层填满"的年代是合理的：
-	#   那时"该方向没跑道"基本等于"你在最顶层还想往上"，是真的无意义输入。
-	#   但大幅留空之后它成了高频事件 —— 此时静默吞掉按键，玩家读到的是
-	#   "我的操作没被听见"，而不是"这个方向没路"。
-	#   现在改成【原地跳】：按键永远有反馈，但不换层、不前进。
-	#   成本按"你是不是在拿它逃伤害"定价（见 GameConfig.INPLACE_JUMP_FREE_ON_SAME）。
-	var in_place := target < 0
-	if in_place:
+	var jumping := dir > 0
+	var apex: float = GameConfig.LAYER_Y[layer]
+	var lowest: int = 0
+	var highest: int = layer - 1
+	# 落点时刻的那条规矩：跳跃是常量，下坠是自由落体。这是三条路径唯一的差别。
+	var time_for: Callable = _jump_time_to if jumping else _fall_time_to
+	if jumping:
+		apex = GameConfig.jump_apex_from(layer)
+		highest = _top_layer_under(apex)        # 跳：最远够到 本层+1
+	else:
+		highest = layer - 1                     # 落：必须真的往下走
+	var from_layer := layer
+	var target := _resolve_landing(lowest, highest, time_for)
+
+	if target < 0:
+		# 这个方向没有可落的跑道。原地弹跳（走跳跃那条弧线，与本层起跳一致）——
+		# 按键永远有反馈，且【绝不致死】：真掉下去了也是下一帧的缺口判定说话。
+		jumping = true
 		target = layer
+		apex = GameConfig.jump_apex_from(layer)
 
 	airborne = true
-	falling = false
-	_air_time = GameConfig.JUMP_AIR_TIME
+	falling = not jumping
+	# 时长：跳跃取常量；下坠取落差的重力解（掉 1 层 0.50s / 掉 2 层 0.71s）。
+	#   下坠这条路上 _air_time 是【结果】—— 它必须和 jump_to 配套，
+	#   否则 t² 曲线画出来的就不是重力（改落点却不改时长 = 掉两层凭空变快）。
+	_air_time = GameConfig.JUMP_AIR_TIME if jumping \
+		else GameConfig.fall_air_time(from_layer, target)
 	jump_t = 0.0
-	jump_from = layer
+	jump_from = from_layer
 	jump_to = target
-	_squash = 1.32                      # 起跳拉伸
-	# 跨越层数【不再影响弧线】—— 顶点是固定的绝对高度（GameConfig.JUMP_APEX_Y）。
-	#   旧实现按 span 放大弧高（span=2 时 ×1.55），结果是"跳得越远弧线越高"，
-	#   玩家能从弧线预判落点。用户要求统一，这条预判线索就交还给关卡本身了。
-	#   滞空同样保持常量（JUMP_AIR_TIME）：它同时是跳跃成本的净收益核算基准、
+	# 起跳拉伸 1.32（与坠落的 1.38 刻意错开，见 GameConfig.FALL_STRETCH）。
+	#   坠落那一路的拉伸由 _update_transform 按 t 驱动，这里给 1.0 让位。
+	_squash = 1.32 if jumping else 1.0
+	# 弧线峰值 = 本层 + 4.4（顶层受 JUMP_APEX_MAX_Y 夹住）。
+	#   滞空保持常量（JUMP_AIR_TIME）：它同时是跳跃成本的净收益核算基准、
 	#   也是"一次跳跃前进多远"这个关卡段长下界的来源。
-	_solve_jump_arc(layer, target)
+	if jumping:
+		_solve_jump_arc(layer, target, apex)
 
-	# 原地跳的定价：脚下是同色 → 免费（它没在替你挡伤害）；
-	# 脚下是异色 → 照收，因为空中冻结实打实挡掉了 9 点伤害。
-	# 判定刻意用 color_at_t（当前时刻的真实颜色）而不是缓存的 state：
-	# 按键发生在 tick 之前，用缓存值会读到上一帧的颜色，脉冲段上会错一档。
-	var cost: float = GameConfig.JUMP_ENERGY_COST
-	if in_place and GameConfig.INPLACE_JUMP_FREE_ON_SAME \
-			and level.color_at_t(distance, layer, elapsed) == player_color:
-		cost = 0.0
+	# 定价：只有【没换层】才看脚下颜色（同色免费 / 异色照收 8 点）。
+	#   判定刻意用 color_at_t（当前时刻的真实颜色）而不是缓存的 state：
+	#   按键发生在 tick 之前，用缓存值会读到上一帧的颜色，脉冲段上会错一档。
+	var cost := 0.0
+	if target != layer:
+		cost = GameConfig.JUMP_ENERGY_COST if jumping else GameConfig.FALL_ENERGY_COST
+	elif GameConfig.INPLACE_JUMP_FREE_ON_SAME \
+			and level.color_at_t(distance, layer, elapsed) != player_color:
+		cost = GameConfig.JUMP_ENERGY_COST
 	energy = maxf(energy - cost, 0.0)
 
-## 解一条【固定顶点】的抛物线 y(t) = 层A + b·t + a·t²，过 (0, 层A) 与 (1, 层B)，
-## 且峰值恰好 = GameConfig.JUMP_APEX_Y。只用于向上/原地跳（下坠走 t²，见 _update_jump）。
+## 解一条抛物线 y(t) = 出发层 + b·t + a·t²，过 (0, 出发层) 与 (1, 落点层)，
+## 且峰值【恰好】= apex。只用于跳跃（下坠/踩空走 t²，见 _update_jump）。
 ##
-## 推导（别在这里重新推一遍，要改先看 GameConfig.JUMP_APEX_Y 的注释）：
-##   y(0) = 层A            → 常数项就是层A
-##   y(1) = 层B            →  b + a = d，其中 d = 层B − 层A
-##   峰值 = 顶点            →  层A − b²/(4a) = 顶点
-##   令 m = 顶点 − 层A（这一跳要爬多高）、u = √m + √(m − d)，解得
+## 推导（要改先看 GameConfig 里那段注释，别在这里重新推）：
+##   y(0) = 出发层          → 常数项就是出发层
+##   y(1) = 落点层          →  b + a = d，其中 d = 落点层 − 出发层
+##   峰值 = apex            →  出发层 − b²/(4a) = apex
+##   令 m = apex − 出发层、u = √m + √(m − d)，解得
 ##     b = 2u√m ,  a = d − b ,  峰值时刻 t_p = b / (2(b − d))
 ##
 ## 为什么取"加号"那支根（u = √m + √(m−d) 而不是减号）：
-##   减号那支在 d = 0（原地跳）时退化成 u = 0 → a = b = 0 → 曲线恒等于层高，
-##   也就是"原地跳什么都看不见"。加号那支在 d = 0 时自动给出对称弧（t_p = 0.5）。
+##   减号那支在 d = 0（落回本层）时退化成 u = 0 → a = b = 0 → 曲线恒等于层高，
+##   也就是"原地弹跳什么都看不见"。加号那支在 d = 0 时自动给出对称弧（t_p = 0.5）。
 ##
-## 调用前提：target ≥ layer（向上或原地）。顶点高于顶层，所以 m > 0 恒成立；
-##   m − d = 顶点 − 层B ≥ 余量 > 0 也恒成立，sqrt 不会拿到负数。
-func _solve_jump_arc(from_layer: int, to_layer: int) -> void:
+## 【三次定稿后 d 只有三种取值】0（弹回本层）/ 3.2（跳上一层）/ 负值（在段末尾
+##   起跳、上一层是缺口 → 跳出去落到更低那层）。三种都满足 m − d > 0，
+##   所以 sqrt 永远不会拿到负数（maxf 只是防御）。
+func _solve_jump_arc(from_layer: int, to_layer: int, apex: float) -> void:
 	var from_y: float = GameConfig.LAYER_Y[from_layer]
-	var to_y: float = GameConfig.LAYER_Y[to_layer]
-	var m: float = GameConfig.JUMP_APEX_Y - from_y     # 这一跳要爬多高
-	var d: float = to_y - from_y                       # 净位移（原地跳为 0）
+	var m: float = apex - from_y                        # 这一跳要爬多高
+	var d: float = GameConfig.LAYER_Y[to_layer] - from_y # 净位移（弹回本层为 0）
 	var u: float = sqrt(m) + sqrt(maxf(m - d, 0.0))
 	_jump_b = 2.0 * u * sqrt(m)
 	_jump_a = d - _jump_b
 
-## 该方向上最近的实体跑道所在层。返回 -1 = 该方向没有跑道。
+## 【竖直动作的落点解析 —— 本作跳跃机制的全部物理就在这一个函数里】
 ##
-## 注意用 color_at 而不是 color_at_t：脉冲段翻转相位时跑道依然【存在】，
-## 只是颜色变了。用带时间的版本会让玩家在最需要起跳的那一刻被判定"那边没路"。
+## 在 [lowest, highest] 这个层区间里【从高往低】找第一块能站住的实体跑道。返回 -1 = 一块都没有。
 ##
-## 【2026-10-10 修 · "跳跃按键无效"】
-##   旧版按【当前距离】解析落点。但一次跳跃在空中会前进
-##   speed × JUMP_AIR_TIME（常速 = 12 × 0.58 = 6.96m），落点其实在【前方】。
-##   关卡大幅留空后，玩家站在段末尾按下跳跃时，落点已经越过段边界落到了下一段上；
-##   而旧版还在查上一段的颜色 —— 上一段那个方向根本没有跑道 → 返回 -1 →
-##   【按键被整个吞掉】。紧接着玩家跑过边界，又立刻判定坠落。
-##   于是"往上跳到另一层"这个留空关卡的核心动作，几乎每一次都按不出来。
+## 【2026-10-10 三次定稿】跳跃 / 主动下坠 / 踩空三条路径共用它。共用是刻意的：
+##   白天那次"跳跃按键无效"事故的根因就是【两套落点规则】—— 校验器和引擎各算各的，
+##   通过校验而玩不了。每多一条复刻就多一次假阳性。
 ##
-##   纸面校验器（SelfTest）一直是按【段边界】解析落点的，所以它一直是对的 ——
-##   这次错的是引擎，不是关卡。教训与上一轮（原型错、关卡对）方向相反，但同源:
-##   【校验器和引擎必须共用同一套落点模型，否则"通过校验"毫无意义。】
+## lowest / highest  允许落脚的层区间（都含端点）。
+##   跳跃：lowest = 0（本层也能弹回）、highest = 峰值够得到的最高的层（= 本层+1）。
+##   下坠 / 踩空：lowest = 0、highest = **layer − 1**。两端合起来的意思是
+##     "必须真的往下走，且可以一直掉到下面最高的那条"，
+##     ⚠ 两个端点都不能改：highest 若放到 layer 就把本层算进来，按 S 会落在自己
+##       脚下（原地弹），S 键静默失灵；lowest 若抬到 layer−1 又会让"层1 是空的、
+##       层0 有跑道"这种最常见的地形变成无路可走（掉不到层0，只能等死）。
 ##
-## 依赖：段长 ≥ speed × JUMP_AIR_TIME。冲刺速度下是 12m，硬约束 3 已保证段长 ≥ 12m。
+## time_for  一个回调：**落到第 l 层要用几秒**。这是三条路径唯一的差别。
+##
+## 【2026-10-10 四次定稿：从"一个时长"改成"每层一个时长"】
+##   旧签名是 `land_time: float` —— 所有候选层共用同一个落点时刻。那是为跳跃写的，
+##   因为跳跃够到的层由峰值决定，和时长本身就是解耦的两件事。
+##   但下坠是自由落体：掉 1 层和掉 2 层的耗时【本来就不同】，共用一个时长
+##   等于假装落差不存在（旧版 FALL_AIR_TIME = 0.5 让掉两层凭空变快）。
+##   改成回调之后，"选哪一层"和"几秒到"就解耦了：
+##     跳跃 → func(_l): return JUMP_AIR_TIME         （常量，与层无关）
+##     下坠 → func(l):  return fall_air_time(出发层, l)（重力解，随落差生长）
+##   仍然是【一套】循环、一套 color_at 判定、一套"从高往低取第一块" ——
+##   分家的只剩"时刻怎么算"这一条，而且它现在是显式传进来的，藏不住。
+##
+##   为什么落点必须按【落地那一刻的距离】查：空中还会以 _cur_speed 前进 time 秒
+##     （跳跃 6.96m；下坠掉一层 6m、掉两层 8.5m），拿当前距离去查会查到上一段的
+##     颜色，那正是老事故。
+##
+## 用 color_at 而不是 color_at_t：脉冲段翻转相位时跑道依然【存在】，只是颜色变了。
+##   用带时间的版本会让玩家在最需要起跳的那一刻被判定"那边没路"。
+func _resolve_landing(lowest: int, highest: int, time_for: Callable) -> int:
+	if level == null:
+		return -1
+	for l in range(highest, lowest - 1, -1):
+		# l < 0（在最底层要求"必须往下"）→ 一层都不可落。必须显式判：
+		#   GDScript 的负下标是"从末尾数"，LAYER_Y[-1] 会静默变成顶层。
+		# l >= LAYER_COUNT 同理，range 的上端可能越界（跳跃时 highest 会算到 3）。
+		if l < 0:
+			return -1
+		if l >= GameConfig.LAYER_COUNT:
+			continue
+		var land := distance + _cur_speed * float(time_for.call(l))
+		if level.color_at(land, l) != GameConfig.NO_TRACK:
+			return l
+	return -1
+
+## 跳跃的落点时刻：常量。峰值由 JUMP_APEX_HEIGHT 定死，与落到哪一层无关。
+func _jump_time_to(_to_layer: int) -> float:
+	return GameConfig.JUMP_AIR_TIME
+
+## 下坠的落点时刻：自由落体 √(2h/g)。从【当前层】算，不是从候选层算。
+func _fall_time_to(to_layer: int) -> float:
+	return GameConfig.fall_air_time(layer, to_layer)
+
+## 峰值高度 apex 之下【最高】的那一层。跳跃"最远只能够到这一层"，
+## 所以它同时表达了"跳得到"和"只能跳一层"两条 —— 由同一个 apex 反解，不会各说各话。
+func _top_layer_under(apex: float) -> int:
+	var top := -1
+	for l in GameConfig.LAYER_COUNT:
+		if GameConfig.LAYER_Y[l] <= apex + 0.001:
+			top = l
+	return top
+
+## 若现在朝 dir 做一次竖直动作，会落在哪一层。返回 -1 = 落不到任何实体跑道。
+##
+## 【这是查询，不是动作】校验器（SelfTest.check_forward_escape）和 bot（PlayTest）
+##   靠它决定"这里有没有路""值不值得按"。所以它必须和 request_jump 走同一个
+##   _resolve_landing —— 复刻一份落点规则 = 制造假阳性，这条纪律是有血债的。
 func next_track_layer(dir: int) -> int:
 	if level == null:
 		return -1
-	var land := distance + _cur_speed * GameConfig.JUMP_AIR_TIME
-	var l := layer + dir
-	while l >= 0 and l < GameConfig.LAYER_COUNT:
-		if level.color_at(land, l) != GameConfig.NO_TRACK:
-			return l
-		l += dir
-	return -1
+	if dir > 0:
+		var apex := GameConfig.jump_apex_from(layer)
+		return _resolve_landing(0, _top_layer_under(apex), _jump_time_to)
+	return _resolve_landing(0, layer - 1, _fall_time_to)
 
-## 本帧起跳会前进的水平距离（= 当前速度 × 滞空时间）。
-## 缺口预警用它判断"现在按还来不来得及"：跳跃窗口 = 0.5s，与速度无关，
-## 但换算成距离会随速度变（常速 6m / 加速带 10.8m / 冲刺 12m）。
-func jump_reach() -> float:
-	return _cur_speed * GameConfig.JUMP_AIR_TIME
+## 落到 [to_layer] 的那一次竖直动作会前进多少米 —— 也就是落点解析查的那个距离
+## （distance + 本值）。
+##
+## 【2026-10-10 四次定稿 · 取代了旧的 jump_reach()】
+##   旧版只有一个 `jump_reach()` = _cur_speed × JUMP_AIR_TIME，因为那时下坠的
+##   滞空是个常量（FALL_AIR_TIME = 0.5），和跳跃差不多，一个数糊得过去。
+##   下坠改成自由落体之后这个假设塌了：掉一层只走 6.0m（比重载 6.96m 短）、
+##   掉两层要走 8.49m。用一个数去回答两个方向的问题，两边都会错 ——
+##     用 6.96 判"掉一层来得及"→ 提前 0.96m 就喊"现在可以按"，
+##       玩家按下去落点却还在缺口里 → 就是"按键无效"那个老症状；
+##     用 6.96 判"掉两层来得及"→ 又白白晚喊 1.5m，玩家以为没机会了。
+##   所以必须传目标层：上跳/原地弹是常量，下坠由落差算出来。
+func reach_to(to_layer: int) -> float:
+	if to_layer >= layer:
+		# 上跳，以及"无路可退时的原地弹"（那条路走的就是跳跃弧线）
+		return _cur_speed * GameConfig.JUMP_AIR_TIME
+	return _cur_speed * GameConfig.fall_air_time(layer, to_layer)
 
 func request_switch_color() -> void:
 	if not alive:

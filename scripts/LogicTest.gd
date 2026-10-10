@@ -15,6 +15,7 @@ func _ready() -> void:
 	_test_jump_across_boundary()
 	_test_unified_jump_arc()
 	_test_track_gap()
+	_test_natural_fall()
 	_test_air_rescue()
 	_test_dash()
 	_test_death()
@@ -125,7 +126,34 @@ func _test_three_layer_jump() -> void:
 	for i in int(ceil(GameConfig.JUMP_AIR_TIME * 60.0)) + 12:
 		p.tick(1.0 / 60.0)
 	_check("连跳两次到顶层", p.layer == 2)
+
+	# 【2026-10-10 三次定稿 · 回归守卫】站在实体跑道上按 S 必须【真的下降】。
+	#   三次定稿第一次实现时，落点扫描把"本层"也算进了候选，于是按 S 会落到自己
+	#   脚下 —— S 键静默失灵，而看起来一切正常（airborne 为真、有弧线）。
+	#   这条断言就是那个坑的探测器：脚下有跑道时，S 必须落到更低的层。
+	p.request_jump(-1)
+	_check("在顶层按 S 必须下降（不能落回本层）", p.airborne and p.jump_to == 1)
+	for i in int(ceil(GameConfig.fall_air_time(2, 1) * 60.0)) + 12:
+		p.tick(1.0 / 60.0)
+	_check("主动下坠落在层1", p.layer == 1)
 	p.queue_free()
+
+	# 【三次定稿 · 回归守卫 2】层1 是空的时候，按 S 必须能【一次掉到层0】。
+	#   这是留空关卡最常见的地形（层1 空、层0 与层2 有跑道）。
+	#   第一次实现时把下坠区间写成了"只准降一层"，于是这种地形下按 S 毫无反应。
+	#   ⚠ 四次定稿后这里是【掉两层】→ 耗时 0.71s 而不是 0.5s，
+	#     帧数必须从 fall_air_time 算，写死 0.5s 的循环会在这条上假红。
+	var skip_lv := _level([{"length": 400.0, "colors": [0, -1, 0]}])
+	var q := Player.new()
+	q.setup(skip_lv)
+	q.layer = 2
+	q._y = GameConfig.LAYER_Y[2]
+	q.request_jump(-1)
+	_check("层1 空时按 S 一次掉到层0（跨空层下落）", q.airborne and q.jump_to == 0)
+	for i in int(ceil(GameConfig.fall_air_time(2, 0) * 60.0)) + 12:
+		q.tick(1.0 / 60.0)
+	_check("跨空层下坠落在层0", q.layer == 0)
+	q.queue_free()
 
 func _test_inplace_jump_cost() -> void:
 	print("Test: 原地跳的定价（同色免费 / 异色照收）")
@@ -152,11 +180,11 @@ func _test_inplace_jump_cost() -> void:
 
 func _test_jump_across_boundary() -> void:
 	print("Test: 留空关卡的跨段跳跃（段末尾起跳，落到下一段的层）")
-	# 【回归测试】这一条对应"跳跃按键无效"事故。
-	#   留空改造后最常见的局面：本段只有我这层，下一段只有另一层。
-	#   玩家必须在【本段末尾】就能把落点解析到【下一段】——
-	#   旧引擎按"当前距离"解析，于是永远查的是本段，返回 -1，按键被整个吞掉，
-	#   紧接着跑过边界当场坠落。校验器当时按"段边界"解析，所以全绿。
+	# 【回归测试】这一条对应"跳跃按键无效"事故，三次定稿后仍然有效 ——
+	#   落点必须在【落地那一刻的距离】(distance + 速度 × 滞空) 上解析。
+	#   本段只有我这层、下一段只有另一层时，玩家必须在【本段末尾】就能把落点
+	#   解析到下一段。用当前距离解析 → 查的是本段 → 返回 -1 → 按键被吞，
+	#   紧接着跑过边界又立刻坠落。这是本作最贵的一次事故，断言保留。
 	var lv := _level([
 		{"length": 72.0, "colors": [0, -1, -1]},   # 只有底层
 		{"length": 48.0, "colors": [-1, 0, -1]},   # 只有中层
@@ -179,8 +207,8 @@ func _test_jump_across_boundary() -> void:
 	w.request_jump(1)
 	_check("窗口左沿（落点压在边界）仍可起跳", w.airborne)
 
-	# 太早按：落点还在本段内，本段没有上层 → 不再是"无效"，
-	# 而是【原地跳】（不换层）。按键依然有反馈，这是 2026-10-10 的规则改动。
+	# 太早按：落点还在本段内 → 本段没有上层，物理上自然弹回本层。
+	#   新规则下这不再是"无效输入"也不是特殊分支，就是 _resolve_landing 撞出来的结果。
 	var q := Player.new()
 	q.setup(lv)
 	q.distance = 72.0 - reach - 1.0
@@ -201,19 +229,25 @@ func _test_jump_across_boundary() -> void:
 	p.queue_free(); w.queue_free(); q.queue_free(); r.queue_free()
 
 func _test_unified_jump_arc() -> void:
-	print("Test: 跳跃整合（三种向上跳共用同一条固定顶点曲线）")
-	# 【2026-10-10 用户要求】把「跳跃」和「跳到上一层」整合成同一条曲线，
-	#   顶点取【固定的绝对高度】。所以断言从上一轮的"两种跳跃凑成一样高"
-	#   升级为"三种跳跃的峰值都等于 JUMP_APEX_Y" ——
-	#   原地跳(d=0)、上1层(d=3.2)、跨空层上2层(d=6.4)。
+	print("Test: 跳跃（单纯跳跃 —— 峰值只由出发层决定，落点由物理撞出来）")
+	# 【2026-10-10 三次定稿】用户要求「去掉跳到上一层跑道的规则，只有单纯的跳跃，
+	#   跳跃的高度可以足够让玩家跳到上一层的跑道」。
+	#   所以断言从上一版的"顶点 = 落点层 + 余量"改成下面这条更强的不变量：
 	#
-	#   它们的峰值【时刻】不同（爬得越高峰值越靠后）：d=0 → t_p=0.5、
-	#   d=3.2 → ≈0.568、d=6.4 → ≈0.716。但公式和顶点是同一个 ——
-	#   这就是"整合"：不再是两条曲线被调参凑到一起。
-	var apex := GameConfig.JUMP_APEX_Y
-	var top := GameConfig.LAYER_Y[GameConfig.LAYER_COUNT - 1]
+	#     ① 【弧高与落点解耦】同样从层0 起跳，"跳上一层 / 弹回本层 / 上面够不着"
+	#        三种局面必须【飞一样高】—— 跳跃不知道上面有什么，是关卡决定它撞到哪。
+	#        这条一旦变红，说明又有人把"落点"塞回峰值公式里了。
+	#     ② 峰值落在上一层与再上一层【之间】—— 这同时就是"能跳上去"和"只能跳一层"：
+	#          3.2 (+1层) < 4.4 (峰值) < 6.4 (+2层)
+	#     ③ 顶层起跳被 JUMP_APEX_MAX_Y 夹住（三层盒子的顶盖）。
+	#     ④ 落点：三层全满 → 落到层1；层1 是缺口 → 弹回层0（跳不到层2）。
+	var y0: float = GameConfig.LAYER_Y[0]
+	var y1: float = GameConfig.LAYER_Y[1]
+	var y2: float = GameConfig.LAYER_Y[2]
+	var expect_peak: float = y0 + GameConfig.JUMP_APEX_HEIGHT
+	var tol := 0.12
 
-	# 单层关：该方向没有跑道 → 原地跳
+	# a: 单层关（只有层0）→ 上面什么都没有，弹回本层
 	var one_lv := _level([{"length": 400.0, "colors": [0, -1, -1]}])
 	var a := Player.new()
 	a.setup(one_lv)
@@ -223,7 +257,7 @@ func _test_unified_jump_arc() -> void:
 		a.tick(1.0 / 60.0)
 		inplace_peak = maxf(inplace_peak, a._y)
 
-	# 三层全满 → 从层0 跳到层1
+	# b: 三层全满 → 从层0 跳到层1
 	var full_lv := _level([{"length": 400.0, "colors": [0, 0, 0]}])
 	var b := Player.new()
 	b.setup(full_lv)
@@ -233,41 +267,64 @@ func _test_unified_jump_arc() -> void:
 		b.tick(1.0 / 60.0)
 		up1_peak = maxf(up1_peak, b._y)
 
-	# 层1 是缺口 → 从层0 一次【跨过空层】跳到层2
+	# c: 层1 是缺口、层2 有跑道 —— 旧规则下这一跳会【跨空层直接上顶层】，
+	#    新规则下峰值 4.4 够不着 6.4，所以只能弹回层0。这就是"只能跳一层"。
 	var skip_lv := _level([{"length": 400.0, "colors": [0, -1, 0]}])
 	var c := Player.new()
 	c.setup(skip_lv)
 	c.request_jump(1)
-	var up2_peak := -INF
+	var skip_peak := -INF
 	for i in 60:
 		c.tick(1.0 / 60.0)
-		up2_peak = maxf(up2_peak, c._y)
+		skip_peak = maxf(skip_peak, c._y)
+
+	# d: 从顶层起跳 —— 峰值照加 4.4 会到 10.8m，必须被 JUMP_APEX_MAX_Y 夹住
+	var d := Player.new()
+	d.setup(full_lv)
+	d.layer = 2
+	d._y = y2
+	d.request_jump(1)
+	var top_peak := -INF
+	for i in 60:
+		d.tick(1.0 / 60.0)
+		top_peak = maxf(top_peak, d._y)
 
 	# 60fps 采样不会正好落在峰值上（每帧 t 走 1/60/0.58 ≈ 0.029，
 	#   峰值附近 1 帧的高度差 < 0.01m），但为了不写成脆弱的断言取 0.12 容差。
-	var tol := 0.12
-	_check("原地跳峰值 = 固定顶点 %.2f（偏差 < %.2f）" % [apex, tol],
-		absf(inplace_peak - apex) < tol)
-	_check("跳上一层峰值 = 同一个顶点（与原地跳严格同高）",
-		absf(up1_peak - apex) < tol)
-	_check("跨空层跳两层峰值 = 同一个顶点（跳一层与跳两层视觉一样）",
-		absf(up2_peak - apex) < tol)
-	_check("顶点高于顶层 %.1fm（统一冲到顶层之上）" % top, inplace_peak > top)
-	_check("顶点 = 顶层 + JUMP_APEX_CLEARANCE %.2f" % GameConfig.JUMP_APEX_CLEARANCE,
-		absf(apex - (top + GameConfig.JUMP_APEX_CLEARANCE)) < 0.001)
+	_check("① 弧高与落点解耦：弹回本层 %.2f = 跳上一层 %.2f = 够不着时 %.2f" % [
+			inplace_peak, up1_peak, skip_peak],
+		absf(inplace_peak - up1_peak) < tol and absf(up1_peak - skip_peak) < tol)
+	_check("①b 三者峰值都 = 出发层 + %.2f（实测 %.2f）" % [
+			GameConfig.JUMP_APEX_HEIGHT, up1_peak],
+		absf(inplace_peak - expect_peak) < tol and absf(up1_peak - expect_peak) < tol
+		and absf(skip_peak - expect_peak) < tol)
 
-	# 落点仍然由【方向上的最近实体跑道】决定 —— 顶点统一不等于落点统一。
-	_check("原地跳不换层（落回层0）", a.layer == 0 and absf(a._y - GameConfig.LAYER_Y[0]) < 0.02)
-	_check("跳上一层落在层1", b.layer == 1 and absf(b._y - GameConfig.LAYER_Y[1]) < 0.02)
-	_check("跨空层落在层2（不是层1）", c.layer == 2 and absf(c._y - GameConfig.LAYER_Y[2]) < 0.02)
+	_check("② 峰值高过上一层（%.2f > %.2f）—— 够得着" % [up1_peak, y1], up1_peak > y1)
+	_check("②b 峰值低于再上一层（%.2f < %.2f）—— 只能跳一层" % [up1_peak, y2],
+		up1_peak < y2)
+	_check("②c 冗余可见（高出上一层 %.2f ≥ 0.8 × %.2f）" % [
+			up1_peak - y1, GameConfig.JUMP_APEX_CLEARANCE],
+		up1_peak - y1 > GameConfig.JUMP_APEX_CLEARANCE * 0.8)
 
-	# 三种跳跃的滞空必须一样长 —— 否则"整合"只整合了形状，没整合节奏。
-	_check("三种跳跃滞空同为 %.2fs" % GameConfig.JUMP_AIR_TIME,
+	_check("③ 顶层起跳被夹在 JUMP_APEX_MAX_Y = %.2f（实测 %.2f）" % [
+			GameConfig.JUMP_APEX_MAX_Y, top_peak],
+		absf(top_peak - GameConfig.JUMP_APEX_MAX_Y) < tol and top_peak < 10.0)
+
+	_check("④ 三层全满 → 落到层1", b.layer == 1 and absf(b._y - y1) < 0.02)
+	_check("④b 层1 是缺口 → 弹回层0（跳不到层2）",
+		c.layer == 0 and absf(c._y - y0) < 0.02)
+	_check("④c 单层关 → 弹回本层", a.layer == 0 and absf(a._y - y0) < 0.02)
+	_check("④d 顶层起跳落回顶层", d.layer == 2 and absf(d._y - y2) < 0.02)
+
+	# 滞空必须一样长 —— 弧高、落点都改了，节奏不能跟着变
+	#   （JUMP_AIR_TIME 同时是"一次跳跃前进多远"的下界，见 GameConfig）。
+	_check("四种局面的滞空同为 %.2fs" % GameConfig.JUMP_AIR_TIME,
 		absf(a._air_time - GameConfig.JUMP_AIR_TIME) < 0.0001
 		and absf(b._air_time - GameConfig.JUMP_AIR_TIME) < 0.0001
-		and absf(c._air_time - GameConfig.JUMP_AIR_TIME) < 0.0001)
+		and absf(c._air_time - GameConfig.JUMP_AIR_TIME) < 0.0001
+		and absf(d._air_time - GameConfig.JUMP_AIR_TIME) < 0.0001)
 
-	a.queue_free(); b.queue_free(); c.queue_free()
+	a.queue_free(); b.queue_free(); c.queue_free(); d.queue_free()
 
 func _test_track_gap() -> void:
 	print("Test: 跑道缺口（坠落代价 / 无路可走）")
@@ -333,7 +390,12 @@ func _test_track_gap() -> void:
 		y_prev = p._y
 
 	_check("踩空进入【坠落】状态，而不是瞬移换层", started)
-	_check("坠落有可见时长 ≈0.5s（30 帧）", air_frames >= 28 and air_frames <= 32)
+	# 【四次定稿】掉一层 = 0.50s 是【自由落体的解】，不再是常量 FALL_AIR_TIME。
+	#   帧数从 GameConfig 算，写死 30 的话这条断言会在下一次标定时无声变成假话。
+	var one_layer_frames := int(round(GameConfig.fall_air_time(1, 0) * 60.0))
+	_check("掉一层的坠落时长 = 自由落体解 %.2fs（%d 帧）" % [
+		GameConfig.fall_air_time(1, 0), one_layer_frames],
+		absi(air_frames - one_layer_frames) <= 2)
 	_check("坠落期间层号不变（落地才换层）", not layer_changed_midair)
 	_check("坠落全程单调向下，没有回弹", not y_went_up)
 	_check("起坠当帧扣约 8 点", (e_before_fall - e_first_air) > 7.5 and (e_before_fall - e_first_air) < 8.5)
@@ -391,6 +453,137 @@ func _test_track_gap() -> void:
 		p2.tick(1.0 / 60.0)
 	_check("下方也无跑道则坠落致死", not p2.alive)
 	p2.queue_free()
+
+func _test_natural_fall() -> void:
+	print("Test: 下坠 = 自由落体（时长由落差算出来，不是常量）")
+	# 【2026-10-10 四次定稿】用户要求"跳到下一层的逻辑，变成自然下落"。
+	#   旧的 FALL_AIR_TIME = 0.5 是常量 → 掉两层和掉一层一样快，
+	#   观感上"两层楼的落差被凭空压缩了"，且时长这个纯物理量被一个玩法旋钮钉住。
+	#   现在 t = √(2h/g)：时长是【结果】。
+
+	# ① 时长公式本身
+	var t1 := GameConfig.fall_air_time(2, 1)
+	var t2 := GameConfig.fall_air_time(2, 0)
+	_check("掉一层 %.3fs（沿用旧 0.5s 作标定锚点，最常见那次坠落逐帧不变）" % t1,
+		absf(t1 - 0.5) < 0.001)
+	_check("掉两层 = 掉一层 × √2（%.4fs vs %.4fs）" % [t2, t1 * sqrt(2.0)],
+		absf(t2 - t1 * sqrt(2.0)) < 0.001)
+	_check("落差越大掉得越久（这是'自然'的全部含义）", t2 > t1)
+	_check("不是下落时长为 0（同层 / 往上）",
+		GameConfig.fall_air_time(0, 0) == 0.0 and GameConfig.fall_air_time(0, 2) == 0.0)
+
+	# ② 实机：层1 空、层0 与层2 有跑道（留空关卡最常见的地形），
+	#    玩家从层2 一次掉到层0，帧数必须是掉一层的 √2 倍。
+	#    （这条才是"引擎真的按落差给时长"的证据 —— ①只验了公式）
+	#    ⚠ 不能用"三层全满"的关来测：那种关里从层2 下坠只会落到层1，
+	#      落差只有一层，测出来当然还是 30 帧。
+	var gap_lv := _level([{"length": 400.0, "colors": [0, -1, 0]}])
+	var p := Player.new()
+	p.setup(gap_lv)
+	p.layer = 2
+	p._y = GameConfig.LAYER_Y[2]
+	# reach_to 是 HUD 预警与 bot 决策读的"这次动作会前进多远"。
+	#   它是【第二个入口】（落点本体在 _resolve_landing 里），所以必须验它与实机相符 ——
+	#   一旦分家，症状就是"提示说现在按来得及、按下去却落空"。
+	var reach_claim := p.reach_to(0)
+	var d_start := p.distance
+	p.request_jump(-1)
+	var frames_2 := 0
+	var ys: Array[float] = [p._y]
+	while p.airborne and frames_2 < 600:
+		p.tick(1.0 / 60.0)
+		frames_2 += 1
+		if p.airborne:
+			ys.append(p._y)
+	_check("掉两层用 %d 帧（掉一层 %.0f 帧）" % [frames_2, t1 * 60.0],
+		absi(frames_2 - int(round(t2 * 60.0))) <= 2)
+	_check("跨空层掉两层后落地在层0（不是层1）", p.layer == 0)
+	# 实机前进距离含"落地那一帧也走了 0.2m"，所以给 0.2m 容差
+	_check("reach_to(层0) = %.2fm，与实机前进 %.2fm 相符" % [reach_claim, p.distance - d_start],
+		absf(reach_claim - (p.distance - d_start)) < 0.25)
+	# reach_to 必须真的分方向（否则又回到"一个数糊两个方向"的老坑）
+	var dir_probe := Player.new()
+	dir_probe.setup(gap_lv)
+	dir_probe.layer = 2
+	dir_probe._y = GameConfig.LAYER_Y[2]
+	var r_up := dir_probe.reach_to(2)          # 顶层原地弹 = 跳跃
+	var r_1 := dir_probe.reach_to(1)           # 掉一层
+	var r_2 := dir_probe.reach_to(0)           # 掉两层
+	_check("reach_to 分方向且不等：弹 %.2f / 掉一层 %.2f / 掉两层 %.2f" % [r_up, r_1, r_2],
+		r_up > r_1 + 0.5 and r_2 > r_up + 1.0)
+	dir_probe.queue_free()
+
+	# ③ 轨迹必须是【恒加速度】：逐帧位移的一阶差分单调，二阶差分恒定。
+	#    为什么要单验这一条：_y 只进视觉不进判定，所以 SelfTest/PlayTest 都
+	#    查不到它。改了落点却没改 _air_time（或把 t² 换成别的曲线），
+	#    三套校验全绿，而画面里"掉下去"会变成"被搬下去"。
+	#
+	#    ⚠ 符号：y 是【向下减小】的，所以"越掉越快"意味着 d = y[i]−y[i−1]
+	#      越来越负（d1 < d0），二阶差分也就【是负的】−g·dt²。
+	#      第一次实现时按"正的"写，四条断言全假红 —— 方向搞反比数值错更难发现。
+	#
+	#    二阶差分 = ½g·dt²·[(n+1)² − 2n² + (n−1)²] = g·dt²，与 n 无关 ——
+	#    所以"二阶差分是个常量"就是"加速度是常量"，它的值可以直接对比 g，
+	#    不需要知道这是第几帧（帧计数不参与断言）。
+	var dd_min := 1e9
+	var dd_max := -1e9
+	var dd_sum := 0.0
+	var dd_n := 0
+	var monotone := true
+	for i in range(2, ys.size()):
+		var d1 := ys[i] - ys[i - 1]
+		var d0 := ys[i - 1] - ys[i - 2]
+		if d1 >= d0:
+			monotone = false        # 越掉越快：每帧位移必须严格更负
+		dd_sum += d1 - d0
+		dd_n += 1
+		dd_min = minf(dd_min, d1 - d0)
+		dd_max = maxf(dd_max, d1 - d0)
+	var dt := 1.0 / 60.0
+	_check("下坠逐帧位移单调下压（越掉越快，不存在匀速段）", monotone)
+	_check("二阶差分恒定 = 恒加速度（极差 %.6f < 0.001）" % (dd_max - dd_min),
+		dd_max - dd_min < 0.001)
+	var dd_mean := -dd_sum / float(maxi(dd_n, 1))
+	_check("加速度实测 %.6f = g·dt²（FALL_GRAVITY %.1f）" % [
+		dd_mean, GameConfig.FALL_GRAVITY],
+		absf(dd_mean - GameConfig.FALL_GRAVITY * dt * dt) < 0.0005)
+	p.queue_free()
+
+	# ④ 查询与动作同源 —— 铁律的可执行版本。
+	#    next_track_layer 是校验器(check_forward_escape)和 bot 读的"查询"，
+	#    request_jump 是玩家按的"动作"。两者一旦分家就是
+	#    "校验通过而玩不了"（历史事故）。这里并排跑一遍，逐组比对。
+	var probe_lv := _level([
+		{"length": 40.0, "colors": [0, 0, 0]},
+		{"length": 40.0, "colors": [0, -1, 0]},
+		{"length": 200.0, "colors": [0, 0, 0]},
+	])
+	var same := true
+	var groups := 0
+	for d in [10.0, 38.0, 45.0, 79.0, 90.0]:
+		for dir in [1, -1]:
+			var qa := Player.new()
+			qa.setup(probe_lv)
+			qa.layer = 2
+			qa._y = GameConfig.LAYER_Y[2]
+			qa.distance = d
+			_cur_speed_of(qa)
+			var query := qa.next_track_layer(dir)
+			qa.request_jump(dir)
+			groups += 1
+			# 语义约定：查询返回 -1 = "这个方向没有落点"，
+			#   此时动作必须退化成【原地弹】（jump_to == 出发层）而不是别的层 ——
+			#   否则查询说"无路"而动作却把人送到某层，两边就在撒谎。
+			var want: int = query if query >= 0 else 2
+			if qa.jump_to != want:
+				same = false
+				print("      ✗ dist=%.0f dir=%d 查询=%d 动作=%d" % [d, dir, query, qa.jump_to])
+			qa.queue_free()
+	_check("落点【查询】与落点【动作】逐组一致（%d 组 距离×方向）" % groups, same)
+
+## 把 _cur_speed 刷新到当前距离应有的值（查询/动作都读它，测试里不能只填 distance）。
+func _cur_speed_of(p: Player) -> void:
+	p._cur_speed = GameConfig.SPEED_BASE * (p.level.boost_at(p.distance) if p.level != null else 1.0)
 
 func _test_air_rescue() -> void:
 	print("Test: 空中救济（跳跃+切色连招救命）")

@@ -113,6 +113,10 @@ func _ready() -> void:
 ## 不变量：站在任意段末尾的任意可站立层上，至少存在一个方向能落到实体跑道上。
 ##   违反 = 玩家跑到这里必定坠落，与操作无关。这不是难度，是设计错误。
 ##   （只验"有没有路"，不验"路是不是同色"—— 异色落脚点是没问题的。）
+##
+## 【2026-10-10 三次定稿后这条检查的分量变重了】
+##   跳跃只够到上一层，"往空层跳"不再自动跳过空层。于是【N → N+2】的衔接
+##   第一次变成真正走不通的路 —— 以前它只是"多花 8 点"。这条检查就是它的探测器。
 static func check_forward_escape(lv: LevelData) -> Array:
 	var problems: Array = []
 	var p := Player.new()
@@ -130,7 +134,9 @@ static func check_forward_escape(lv: LevelData) -> Array:
 			p.distance = boundary - 0.5
 			p.layer = int(L)
 			if p.next_track_layer(1) < 0 and p.next_track_layer(-1) < 0:
-				problems.append("段%d 层%d：段末尾无路可走（上/下都解析不到实体跑道）" % [i, L])
+				problems.append(
+					"段%d 层%d：段末尾无路可走 —— 下一段只有更高的层（跨两层，跳不上去）"
+					% [i, L])
 	p.free()
 	return problems
 
@@ -217,10 +223,18 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 		var mult: float = float(seg.get("boost", 1.0))
 		var is_pulse: bool = bool(seg.get("pulse", false))
 
-		# 硬约束 3：颜色切换段不得短于"当前速度下"一次跳跃的距离。
+		# 硬约束 3：颜色切换段不得短于"当前速度下一次竖直动作的距离"。
 		# 加速度带时必须按加速后的速度算，否则冲刺/加速时看不见就撞上。
+		#
+		# 【2026-10-10 四次定稿】下坠改成自由落体后，一次动作的滞空不再统一：
+		#   跳跃 0.58s ／ 掉一层 0.50s ／ **掉两层 0.71s**。取最长的那个 ——
+		#   这条约束要防的是"被搬过去而没看见颜色变了"，那就得按最坏情况算。
+		#   旧版写死 JUMP_AIR_TIME，等于假设"下坠永远不会比跳跃飞得久"，
+		#   而下坠改自由落体之后这个假设正好反了（掉两层比重载跳跃还远 1.5m）。
 		var fastest: float = maxf(GameConfig.SPEED_DASH, GameConfig.SPEED_BASE * mult)
-		var min_legible: float = fastest * GameConfig.JUMP_AIR_TIME
+		var longest_air: float = maxf(GameConfig.JUMP_AIR_TIME,
+			GameConfig.fall_air_time(GameConfig.LAYER_COUNT - 1, 0))
+		var min_legible: float = fastest * longest_air
 		if L < min_legible:
 			warnings.append("段%d 长 %.0fm < %.0fm：高速下无法读清，建议加长" % [i, L, min_legible])
 		if is_pulse and L > GameConfig.PULSE_MAX_LEN:
@@ -230,25 +244,29 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 		var note := ""
 
 		# ---- 缺口：当前层此段没有跑道，必须先离开 ----
-		# 向上属于"跳"（按次 8 点，跨几层都是 8）；向下属于"坠"（同样 8 点）。
-		# 两者同价是刻意的：坠落惩罚的是"没提前走"，不是"走得远"。
+		# 【2026-10-10 三次定稿】新规则下一个竖直动作只够到【上一层】，
+		#   所以"离开"只有两种结局：跳上去（若上一层有跑道），或掉到下面最高的那条。
+		#   两者同价 8 点，差别只在滞空时长与前进距离。
+		#   ⚠ 三层全缺 → 无路可走，是设计错误，直接判失败。
 		if int(colors[layer]) == GameConfig.NO_TRACK:
-			var dest := _nearest_available_layer(colors, layer)
+			var dest := _highest_track_at_or_below(colors, layer + _jump_reach_layers())
 			if dest < 0:
 				log_lines.append("段%-2d 三层全缺口 —— 关卡设计错误（无路可走）" % i)
 				return _fail(level, time, energy, min_energy, dashes, jumps, switches,
 					gaps, log_lines, warnings, gate_notes)
-			var air_steps := 1
-			var escape_cost := GameConfig.FALL_ENERGY_COST
-			if dest > layer:
-				air_steps = _jump_steps(colors, layer, dest)
-				escape_cost = GameConfig.JUMP_ENERGY_COST * float(air_steps)
-			energy = maxf(energy - escape_cost, 0.0)
-			var gair := minf(GameConfig.SPEED_BASE * GameConfig.JUMP_AIR_TIME * float(air_steps), L)
-			time += GameConfig.JUMP_AIR_TIME * float(air_steps)
+			var up_move := dest > layer
+			# 【2026-10-10 四次定稿】下坠时长不再查常量，改由落差算（自由落体）。
+			#   必须在改 layer 之前算 —— fall_air_time 读的是【出发层】。
+			#   掉一层的纸面结果与旧版逐字相同（仍是 0.5s），
+			#   只有"缺口一次掉两层"的段会变慢 0.21s，二/三星线可能随之后移。
+			var air_t: float = GameConfig.JUMP_AIR_TIME if up_move \
+				else GameConfig.fall_air_time(layer, dest)
+			energy = maxf(energy - GameConfig.FALL_ENERGY_COST, 0.0)
+			var gair := minf(GameConfig.SPEED_BASE * air_t, L)
+			time += air_t
 			L -= gair
 			layer = dest
-			gaps += air_steps
+			gaps += 1
 			note = "缺口→层%d" % dest
 
 		# ---- 脉冲段：整段无安全层，只能按最坏相位硬吃 ----
@@ -267,19 +285,25 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 					gaps, log_lines, warnings, gate_notes)
 			continue
 
-		var best := _nearest_same_color_layer(colors, pcolor, layer)
+		var best := _best_same_color_reachable(colors, pcolor, layer)
 
 		if best >= 0:
-			# ---- 有同色层：切到最近的那层。成本 = 需要几次跳跃 × 8 ----
-			var steps := _jump_steps(colors, layer, best)
-			if steps > 0:
-				energy = maxf(energy - GameConfig.JUMP_ENERGY_COST * steps, 0.0)
-				jumps += steps
-				var air_dist := minf(GameConfig.SPEED_BASE * GameConfig.JUMP_AIR_TIME * steps, L)
-				time += GameConfig.JUMP_AIR_TIME * steps
+			# ---- 有够得着的同色层：切过去。一次竖直动作 = 8 点 ----
+			# 【2026-10-10 三次定稿】"够得着"被收紧了：跳跃只到上一层，
+			#   所以"最近"不再是选择依据 —— 只有 {本层, 本层+1, 底下最高的那条}
+			#   三个落点是可达的（见 _best_same_color_reachable）。
+			if best != layer:
+				var up_move := best > layer
+				# 同上：下坠时长由落差算，且要在改 layer 之前算
+				var air_t: float = GameConfig.JUMP_AIR_TIME if up_move \
+					else GameConfig.fall_air_time(layer, best)
+				energy = maxf(energy - GameConfig.JUMP_ENERGY_COST, 0.0)
+				jumps += 1
+				var air_dist := minf(GameConfig.SPEED_BASE * air_t, L)
+				time += air_t
 				L -= air_dist
 				layer = best
-				note = "切层%d(%d跳)" % [layer, steps]
+				note = "切层%d(1次)" % layer
 			var t := _travel_time(L, mult)
 			time += t
 			energy = minf(energy + GameConfig.ENERGY_GAIN_SAME * t, GameConfig.ENERGY_MAX)
@@ -292,6 +316,9 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 			#   L ≤ 66.7m        软门：硬闯也能过，不构成挑战
 			#   66.7 < L ≤ 100m  冲刺门：硬闯必死，冲刺可过
 			#   L > 100m         切色门：冲刺上限 100m 够不到，唯一解是切色
+			# 收费口（toll）地形与门完全一样，只有作者的标记能区分 —— 日志里
+			#   也必须写"收费口"，否则输出会继续说"段8 门 26m"，读者又会误判。
+			var gate_tag := "收费口" if bool(seg.get("toll", false)) else "门"
 			var cost_dash := L * GameConfig.COST_PER_METER_DASH
 			var cost_walk := _walk_cost(L, mult)
 			# 【2026-10-10 新增】连跳穿过同一段的成本，用真实引擎实测。
@@ -303,7 +330,17 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 			# 原型就退化成一个了。
 			var walk_used := cost_hop if arch == Arch.HOP else cost_walk
 
-			if L <= GameConfig.DEATH_ZONE_MIN_LEN and mult <= 1.0:
+			# "toll" 段（收费口）刻意就是"无处可躲、只能硬吃"。它和"软门"地形
+			#   完全相同（纯异色段），但意图相反，所以两种处理都不该走：
+			#   既不报"冲刺失去意义"（那是误报），也不记进 gate_notes
+			#   （gate_notes 是"这道门怎么过"的清单，收费口根本不在其中）。
+			#   ⚠ 别只把 not toll 加到下面那条 if 上 —— 那样它会掉进 elif 链，
+			#   被当成"连跳可过的冲刺门"记进 gate_notes，把误报换个地方接着撒。
+			#   这条豁免不是"消警告"，是把作者的意图读进来：没有标记的短异色段
+			#   【仍然】报警，校验的价值一点没少。
+			if bool(seg.get("toll", false)):
+				pass
+			elif L <= GameConfig.DEATH_ZONE_MIN_LEN and mult <= 1.0:
 				# 加速带上的软门不报警：加速带本身就是"硬闯异色的解法"，
 				# 这类段不是"冲刺失去意义"，是"加速带在这里才对"。
 				warnings.append("段%d %.0fm 软门：硬闯只需 %.0f 点，冲刺失去意义" % [i, L, cost_walk])
@@ -361,18 +398,19 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 				energy -= cost_dash
 				time += L / GameConfig.SPEED_DASH
 				dashes += 1
-				log_lines.append("段%-2d 门 %5.0fm 冲刺 → 能量 %5.1f" % [i, L, energy])
+				log_lines.append("段%-2d %s %5.0fm 冲刺 → 能量 %5.1f" % [
+					i, gate_tag, L, energy])
 			elif picked == Arch.WALK:
 				energy -= walk_used
 				time += _travel_time(L, mult)
 				if arch == Arch.HOP:
 					# 连跳水平速度不变，所以耗时与硬闯一致，省的是能量不是时间
 					jumps += int(ceil(L / (GameConfig.SPEED_BASE * mult * GameConfig.JUMP_AIR_TIME)))
-					log_lines.append("段%-2d 门 %5.0fm 连跳(%.2f点/米) → 能量 %5.1f" % [
-						i, L, walk_used / maxf(L, 0.001), energy])
+					log_lines.append("段%-2d %s %5.0fm 连跳(%.2f点/米) → 能量 %5.1f" % [
+						i, gate_tag, L, walk_used / maxf(L, 0.001), energy])
 				else:
-					log_lines.append("段%-2d 门 %5.0fm 硬闯(%.2f点/米) → 能量 %5.1f" % [
-						i, L, walk_used / maxf(L, 0.001), energy])
+					log_lines.append("段%-2d %s %5.0fm 硬闯(%.2f点/米) → 能量 %5.1f" % [
+						i, gate_tag, L, walk_used / maxf(L, 0.001), energy])
 			else:
 				# 先跳（进入空中豁免），空中切色，落地时已是同色 → 活。
 				energy = maxf(energy - GameConfig.JUMP_ENERGY_COST, 0.0)
@@ -383,8 +421,8 @@ static func simulate(level: LevelData, arch: int = Arch.DASH) -> Dictionary:
 				var t := _travel_time(L, mult)
 				time += t
 				energy = minf(energy + GameConfig.ENERGY_GAIN_SAME * t, GameConfig.ENERGY_MAX)
-				log_lines.append("段%-2d 门 %5.0fm 跳+切色(转%s) → 能量 %5.1f" % [
-					i, L, "橙" if pcolor == 1 else "青", energy])
+				log_lines.append("段%-2d %s %5.0fm 跳+切色(转%s) → 能量 %5.1f" % [
+					i, gate_tag, L, "橙" if pcolor == 1 else "青", energy])
 
 		min_energy = minf(min_energy, energy)
 		if energy <= 0.0:
@@ -407,44 +445,44 @@ static func _fail(_l, time, energy, min_energy, dashes, jumps, switches, gaps,
 	}
 
 ## 从 from 层移动到 to 层需要几次跳跃。
-##   新跳跃规则：落在该方向最近的实体跑道上，不穿透实体 ——
-##   所以"中间被实体跑道占用的层"每一层都要多花一次跳跃。
-##   中间是空的层则被直接跳过，不额外收费。
-## 例：三层全满时 0→2 是 2 跳（与旧规则一致）；
-##     只有 0 和 2 有跑道时 0→2 是 1 跳（这是本次改动的收益）。
-static func _jump_steps(colors: Array, from: int, to: int) -> int:
-	if from == to:
-		return 0
-	var lo: int = mini(from, to)
-	var hi: int = maxi(from, to)
-	var n := 1
-	for k in range(lo + 1, hi):
-		if int(colors[k]) != GameConfig.NO_TRACK:
-			n += 1
-	return n
+## 跳跃能够到的层数上限 —— 从 GameConfig 推导，不写死 "+1"。
+##
+## 【为什么必须推导而不是写字面量】三次定稿把"只能跳一层"变成了几何推论：
+##   峰值 = JUMP_APEX_HEIGHT(4.4) → 可落的层只有 本层 与 本层+1。
+##   如果哪天有人把这个常量抬到 6.5m，这里必须自动跟着变成 +2；
+##   写死的话校验器会继续按 +1 算，于是"关卡通过"变成假话 ——
+##   这正是本文件反复强调的那类假阳性。
+static func _jump_reach_layers() -> int:
+	return int(floor(GameConfig.JUMP_APEX_HEIGHT / GameConfig.LAYER_SPACING))
 
-## 缺口下找最近的有跑道的层。返回 -1 = 三层全无跑道（关卡设计错误）。
-static func _nearest_available_layer(colors: Array, from: int) -> int:
-	var best := -1
-	var best_d := 99
-	for i in colors.size():
-		if int(colors[i]) == GameConfig.NO_TRACK:
-			continue
-		var d := absi(i - from)
-		if d < best_d:
-			best_d = d
-			best = i
-	return best
+## 从 top 层往下找，第一块有跑道的层（含 top）。返回 -1 = 一路到底都没有。
+##
+## 这就是引擎 Player._resolve_landing 的纸面版：峰值高度之下最高的那块实体跑道。
+##   本文件的铁律是"物理一律问引擎"，所以这里只服务于【成本估算】——
+##   "能不能走"由 check_forward_escape 直接调引擎判定，不算在这里。
+static func _highest_track_at_or_below(colors: Array, top: int) -> int:
+	var l := mini(top, colors.size() - 1)
+	while l >= 0:
+		if int(colors[l]) != GameConfig.NO_TRACK:
+			return l
+		l -= 1
+	return -1
 
-## 三层下找同色层：理性玩家必选【最近】的一层 —— 每跨一层 8 点，跨两层 16 点。
-static func _nearest_same_color_layer(colors: Array, pcolor: int, from: int) -> int:
-	var best := -1
-	var best_d := 99
-	for i in colors.size():
-		if int(colors[i]) != pcolor:
-			continue
-		var d := absi(i - from)
-		if d < best_d:
-			best_d = d
-			best = i
-	return best
+## 当前层位下，玩家能落到【同色】的哪一层。返回 -1 = 一个都够不着（那这一段就是门）。
+##
+## 可达集合只有三个（2026-10-10 三次定稿）：
+##   本层（0 点，不用动）
+##   本层 + 1（一次跳跃，8 点）—— 跳跃只够到这里
+##   本层之下最高的那条（一次坠落，8 点）—— 坠落落点不由玩家选，是"下面最高的那条"
+## 偏好顺序 = 本层 → 往上 → 往下：能不动就不动，能往上就不往下
+##   （留空关卡的惯例是下一段在自己的上方，往下掉通常是退路而不是正解）。
+static func _best_same_color_reachable(colors: Array, pcolor: int, from: int) -> int:
+	if int(colors[from]) == pcolor:
+		return from
+	var up := _highest_track_at_or_below(colors, from + _jump_reach_layers())
+	if up > from and int(colors[up]) == pcolor:
+		return up
+	var down := _highest_track_at_or_below(colors, from - 1)
+	if down >= 0 and int(colors[down]) == pcolor:
+		return down
+	return -1

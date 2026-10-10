@@ -15,7 +15,7 @@ extends Node
 ##   5. 流程状态机：READY→PLAYING→WIN→下一关 / DEAD→重开，以及星级分档
 ##
 ## ── 它不做什么 ─────────────────────────────────────────────────
-## 绝不重写任何物理。落点一律问引擎（Player.next_track_layer / jump_reach），
+## 绝不重写任何物理。落点一律问引擎（Player.next_track_layer / reach_to），
 ## 本脚本只负责"每帧替玩家按一个键"，然后把 Main._process 里 PLAYING 分支的
 ## 那三行照原样调一遍。跑不出结果就是关卡或引擎的问题，不是模型的问题。
 ##
@@ -265,15 +265,20 @@ func _drive(p: Player, lv: LevelData, combo: Dictionary, st: Dictionary) -> void
 	var gap: Variant = lv.next_gap(p.distance, p.layer)
 	if gap != null:
 		var gd := float(gap["dist"])
-		if gd <= p.jump_reach():
-			var dir := _pick_dir(p, lv)
-			if dir != 0:
-				_try_jump(p, dir, st)
-				st["jumps_gap"] += 1
-				return
-			elif gd <= 0.0:
-				# 已经站在缺口里、且上下都没有跑道 —— 必摔，记录后不再挣扎
-				st["no_escape"] += 1
+		# 【2026-10-10 四次定稿】窗口这条线必须按【这一次实际要做的动作】算：
+		#   上跳的射程是常量（6.96m），下坠改成自由落体后随落差变
+		#   （掉一层 6.0m、掉两层 8.49m）。旧版一律用 jump_reach，
+		#   于是"掉一层"会被读成"还差 0.96m 也能按" → 按下去落点仍在缺口里。
+		#   这正是"按键无效"那一类假象的老配方，所以先定方向再算窗口。
+		var dir := _pick_dir(p, lv)
+		var reach: float = p.reach_to(p.next_track_layer(dir)) if dir != 0 else 0.0
+		if dir != 0 and gd <= reach:
+			_try_jump(p, dir, st)
+			st["jumps_gap"] += 1
+			return
+		elif dir == 0 and gd <= 0.0:
+			# 已经站在缺口里、且上下都没有跑道 —— 必摔，记录后不再挣扎
+			st["no_escape"] += 1
 
 	var cell := lv.color_at_t(p.distance, p.layer, p.elapsed)
 	if cell == GameConfig.NO_TRACK:
@@ -299,16 +304,17 @@ func _drive(p: Player, lv: LevelData, combo: Dictionary, st: Dictionary) -> void
 	#   ⚠ 只往上看是死角：站在顶层时"上"根本不存在，而收尾段是刻意做成的
 	#     "一青一橙双层"—— 两条路线各自的安全层可能在上也可能在下。
 	#     只查上会把"往下换层就能活"读成死局，然后得出"关卡无解"的错误结论。
-	#   ⚠ 落点一律问引擎（next_track_layer / jump_reach），本函数只负责"选哪个"。
+	#   ⚠ 落点一律问引擎（next_track_layer / reach_to），本函数只负责"选哪个"。
+	#   ⚠ 两个方向各自的落点距离【不一样】（下坠掉一层 6.0m / 掉两层 8.49m），
+	#     所以同一个 land 不能给两个方向共用 —— 那会拿"上跳的落点"去判"下坠的颜色"。
 	if tank_cost > GameConfig.JUMP_ENERGY_COST or p.dashing:
-		var land := p.distance + p.jump_reach()
 		var up := p.next_track_layer(1)
-		if up >= 0 and lv.color_at(land, up) == p.player_color:
+		if up >= 0 and lv.color_at(p.distance + p.reach_to(up), up) == p.player_color:
 			_try_jump(p, 1, st)
 			st["jumps_color"] += 1
 			return
 		var dn := p.next_track_layer(-1)
-		if dn >= 0 and lv.color_at(land, dn) == p.player_color:
+		if dn >= 0 and lv.color_at(p.distance + p.reach_to(dn), dn) == p.player_color:
 			_try_jump(p, -1, st)
 			st["jumps_color"] += 1
 			return
@@ -365,7 +371,7 @@ func _drive(p: Player, lv: LevelData, combo: Dictionary, st: Dictionary) -> void
 			return
 
 ## 目标方向：优先落到【同色层】，其次离得近的。
-## 落点一律问引擎（next_track_layer / jump_reach），本函数只做"选哪个"。
+## 落点一律问引擎（next_track_layer / reach_to），本函数只做"选哪个"。
 func _pick_dir(p: Player, lv: LevelData) -> int:
 	var up := p.next_track_layer(1)
 	var down := p.next_track_layer(-1)
@@ -375,9 +381,10 @@ func _pick_dir(p: Player, lv: LevelData) -> int:
 		return -1
 	if down < 0:
 		return 1
-	var land := p.distance + p.jump_reach()
-	var up_same := lv.color_at(land, up) == p.player_color
-	var down_same := lv.color_at(land, down) == p.player_color
+	# 两个方向的落点距离不同（上跳 6.96m；下坠掉一层 6.0m / 掉两层 8.49m），
+	#   所以各查各的。共用一个 land 会把"上跳的落点"当成"下坠的落点"来读颜色。
+	var up_same := lv.color_at(p.distance + p.reach_to(up), up) == p.player_color
+	var down_same := lv.color_at(p.distance + p.reach_to(down), down) == p.player_color
 	if up_same and not down_same:
 		return 1
 	if down_same and not up_same:
@@ -456,17 +463,21 @@ func _test_state_machine() -> void:
 	_check("READY 按空格 → PLAYING", main.phase == 1)
 
 	# --- 通关与星级分档 ---
-	# L1 二星线 53s / 三星线 49s。逐档验边界 —— 光断言"phase==WIN"是假绿，
-	#   因为不论算成几星 phase 都是 WIN。真正的判定结果是 HUD 标题里的星数，
-	#   所以直接去读它（这是"读玩家看到的东西"，不是读内部变量）。
-	main._on_finished(53.1)
-	_check("53.1s（> 二星线）→ 1 星", _stars_of(main) == 1)
-	main._on_finished(53.0)
-	_check("53.0s（= 二星线）→ 2 星（边界必须算过）", _stars_of(main) == 2)
-	main._on_finished(49.0)
-	_check("49.0s（= 三星线）→ 3 星（边界必须算过）", _stars_of(main) == 3)
-	main._on_finished(30.0)
-	_check("30.0s（远快于三星线）→ 仍是 3 星（不会溢出）", _stars_of(main) == 3)
+	# 星级线【从关卡数据读】，不在这里抄一份副本。抄了的话，以后调星级线这几条
+	#   断言就静默失去意义（还是绿的，但验的是一条早就不存在的线）——
+	#   这与"校验器不许复刻引擎物理"是同一条纪律：验的东西必须是被验的那个东西本身。
+	# 逐档验边界 —— 光断言"phase==WIN"是假绿，因为不论算成几星 phase 都是 WIN。
+	#   真正的判定结果是 HUD 标题里的星数，所以直接去读它（读玩家看到的东西）。
+	var tt: float = main.level.target_time
+	var ct: float = main.level.challenge_time
+	main._on_finished(tt + 0.1)
+	_check("%.1fs（> 二星线 %.1f）→ 1 星" % [tt + 0.1, tt], _stars_of(main) == 1)
+	main._on_finished(tt)
+	_check("%.1fs（= 二星线）→ 2 星（边界必须算过）" % tt, _stars_of(main) == 2)
+	main._on_finished(ct)
+	_check("%.1fs（= 三星线）→ 3 星（边界必须算过）" % ct, _stars_of(main) == 3)
+	main._on_finished(ct * 0.5)
+	_check("%.1fs（远快于三星线）→ 仍是 3 星（不会溢出）" % (ct * 0.5), _stars_of(main) == 3)
 
 	# --- WIN → 下一关 ---
 	main._on_finished(48.0)

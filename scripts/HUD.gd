@@ -156,6 +156,9 @@ func update_hud(p: Player, level: LevelData) -> void:
 	if p.state == Player.State.AIR:
 		if p.falling:
 			_rate_label.text = "坠落：结算暂停（坠落成本已扣 %d 点）" % int(GameConfig.FALL_ENERGY_COST)
+		elif p.jump_to == p.jump_from:
+			# 弹回本层：同色免费、异色照收 —— 不能写死 8 点，那会与账本对不上
+			_rate_label.text = "空中：结算暂停（原地弹回，未换层）"
 		else:
 			_rate_label.text = "空中：结算暂停（跳跃成本已扣 %d 点）" % int(GameConfig.JUMP_ENERGY_COST)
 	else:
@@ -241,45 +244,65 @@ func _update_gate_warning(p: Player, level: LevelData) -> void:
 		var avail := level.track_layers_at(gstart)
 		if avail.is_empty():
 			_gate.text = "前方 %.0f m：三层全断" % float(gap["dist"])
-		else:
-			# 【留空改造补充 · 跳跃按次计费之后】落脚点的远近不再影响成本（跨几层都是 8 点），
-			#   于是"离我最近"不再是好的推荐标准 —— "返回同色层"才是。
-			#   更要紧的是 [A, X, A] 这类【收费口】：三层里根本没有你的颜色，
-			#   最近的落脚点恰恰是异色。提示若只报层号，玩家会以为那是出路，
-			#   跳过去才发现照样掉血 —— 那正是最坏的一种"看不清就罚"。
-			var dst_pulse := level.is_pulse(gstart)
-			var pool: Array = avail
-			if not dst_pulse:
-				var same: Array = []
-				for l in avail:
-					if level.color_at(gstart, int(l)) == p.player_color:
-						same.append(l)
-				if not same.is_empty():
-					pool = same
-			var best := int(pool[0])
-			for l in pool:
-				if absi(int(l) - p.layer) < absi(best - p.layer):
-					best = int(l)
-			var dir_txt := "上跳" if best > p.layer else ("下跳" if best < p.layer else "保持")
-			var key_txt := "W" if best > p.layer else ("S" if best < p.layer else "W/S")
-			# 脉冲段不做颜色判词：它本来就会翻转，判"安全/异色"只在当下成立，
-			# 而且相位有专门的预警通道（_update_mech），混进来会给出错误暗示。
-			var doomed := not dst_pulse and level.color_at(gstart, best) != p.player_color
-			var tail := "（异色 · 会持续掉血）" if doomed else ""
-			if float(gap["dist"]) <= p.jump_reach():
-				# 【跳跃窗口】
-				#   一次跳跃在空中会前进 speed × JUMP_AIR_TIME，落点在前方；
-				#   所以只有当这段前瞻能越过缺口起点时按键才生效。
-				#   换算成时间是恒定的 JUMP_AIR_TIME（距离随速度变，时间不变）。
-				#   不显式标出窗口的话，玩家会在预警刚出现（几十米外）就按，
-				#   然后判定"按键无效"—— 而这恰恰是本轮要修的病灶。
-				_gate.text = "现在！按 %s %s到第 %d 层%s" % [key_txt, dir_txt, best + 1, tail]
-				_gate.modulate = Color(1.0, 0.42, 0.30) if doomed else Color(1.0, 1.0, 1.0)
-				return
-			_gate.text = "前方 %.0f m：本层跑道中断 —— %s到第 %d 层%s" % [
-				float(gap["dist"]), dir_txt, best + 1, tail]
-			_gate.modulate = Color(1.0, 0.42, 0.30) if doomed else Color(1.0, 0.95, 0.35)
+			_gate.modulate = Color(1.0, 0.42, 0.30)
 			return
+		# 【2026-10-10 三次定稿】先把【够不到】的落脚点从推荐池里剔掉。
+		#   跳跃现在只够到上一层，目标段里 2 层以上的跑道是去不了的 ——
+		#   把它们留在池里，HUD 就会推荐"上跳到第 3 层"，而玩家按 W 只会原地弹一下。
+		#   预警宁可说"没有办法"，也不能给一个按不出来的答案。
+		#   （向下不受限：坠落可以一次掉过多层，所以只卡上限。）
+		var reachable: Array = []
+		for l in avail:
+			if int(l) <= p.layer + 1:
+				reachable.append(l)
+		if reachable.is_empty():
+			_gate.text = "前方 %.0f m：本层中断 —— 上面那层跳不到，只能掉下去" % float(gap["dist"])
+			_gate.modulate = Color(1.0, 0.42, 0.30)
+			return
+		avail = reachable
+		# 【留空改造补充 · 跳跃按次计费之后】落脚点的远近不再影响成本（跨几层都是 8 点），
+		#   于是"离我最近"不再是好的推荐标准 —— "返回同色层"才是。
+		#   更要紧的是 [A, X, A] 这类【收费口】：三层里根本没有你的颜色，
+		#   最近的落脚点恰恰是异色。提示若只报层号，玩家会以为那是出路，
+		#   跳过去才发现照样掉血 —— 那正是最坏的一种"看不清就罚"。
+		var dst_pulse := level.is_pulse(gstart)
+		var pool: Array = avail
+		if not dst_pulse:
+			var same: Array = []
+			for l in avail:
+				if level.color_at(gstart, int(l)) == p.player_color:
+					same.append(l)
+			if not same.is_empty():
+				pool = same
+		var best := int(pool[0])
+		for l in pool:
+			if absi(int(l) - p.layer) < absi(best - p.layer):
+				best = int(l)
+		var dir_txt := "上跳" if best > p.layer else ("下坠" if best < p.layer else "保持")
+		var key_txt := "W" if best > p.layer else ("S" if best < p.layer else "W/S")
+		# 脉冲段不做颜色判词：它本来就会翻转，判"安全/异色"只在当下成立，
+		# 而且相位有专门的预警通道（_update_mech），混进来会给出错误暗示。
+		var doomed := not dst_pulse and level.color_at(gstart, best) != p.player_color
+		var tail := "（异色 · 会持续掉血）" if doomed else ""
+		# 【四次定稿】窗口这条线不能再用"跳跃的射程"一把抓：下坠的滞空随落差变
+		#   （掉一层 6.0m、掉两层 8.49m），拿跳跃的 6.96m 去判，
+		#   会在真正够不到的 0.96m 前就喊"现在！"—— 那正是按键被吞掉的老症状。
+		#   所以按【推荐的那一层】算这一次动作真实的前进距离。
+		if float(gap["dist"]) <= p.reach_to(best):
+			# 【窗口】
+			#   一次动作在空中会前进 speed × 滞空时间，落点在前方；
+			#   所以只有当这段前瞻能越过缺口起点时按键才生效。
+			#   不显式标出窗口的话，玩家会在预警刚出现（几十米外）就按，
+			#   然后判定"按键无效"—— 而这恰恰是那次事故的病灶。
+			#   按 W 上跳、按 S 下坠，两者的滞空时间不同（下坠随落差变），
+			#   所以上面那行判据传的是【推荐层】，不是"跳跃的射程"。
+			_gate.text = "现在！按 %s %s到第 %d 层%s" % [key_txt, dir_txt, best + 1, tail]
+			_gate.modulate = Color(1.0, 0.42, 0.30) if doomed else Color(1.0, 1.0, 1.0)
+			return
+		_gate.text = "前方 %.0f m：本层跑道中断 —— %s到第 %d 层%s" % [
+			float(gap["dist"]), dir_txt, best + 1, tail]
+		_gate.modulate = Color(1.0, 0.42, 0.30) if doomed else Color(1.0, 0.95, 0.35)
+		return
 		_gate.modulate = Color(1.0, 0.95, 0.35)
 		return
 
